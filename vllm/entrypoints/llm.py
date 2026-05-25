@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""
+llm.py 是 vLLM 的 离线推理门面层：
+
+    它把用户友好的 Python API 转换成 engine 能理解的请求，
+    并驱动 LLMEngine.step() 完成批量推理；真正的调度、KV cache、worker 执行都在 vllm/v1/engine 和更底层模块中。
+"""
+
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -239,6 +246,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
     ) -> None:
         """LLM constructor."""
 
+        # 构造函数负责把用户友好的 LLM(...) 参数规整成 EngineArgs，
+        # 然后创建真正执行推理的 LLMEngine。这个类本身主要是 offline
+        # API facade，不直接做模型 forward。
         if "swap_space" in kwargs:
             kwargs.pop("swap_space")
             import warnings
@@ -263,6 +273,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         if "kv_transfer_config" in kwargs and isinstance(
             kwargs["kv_transfer_config"], dict
         ):
+            # 用户可以用 dict 传 KV transfer 配置；这里提前转换成强类型
+            # config，后续 EngineArgs/VllmConfig 就不用再处理原始 dict。
             from vllm.config.kv_transfer import KVTransferConfig
 
             raw_config_dict = kwargs["kv_transfer_config"]
@@ -284,6 +296,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
 
         def _make_config(value: Any, cls: type[_R]) -> _R:
             """Convert dict/None/instance to a config instance."""
+            # 许多子配置都允许 None、dict 或已构造好的实例。这个小工具把
+            # 三种入口统一成 config instance，并过滤掉非 __init__ 字段。
             if value is None:
                 return cls()
             if isinstance(value, dict):
@@ -364,6 +378,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
 
         log_non_default_args(engine_args)
 
+        # LLMEngine 是实际的 V1 engine：它持有 VllmConfig、renderer、
+        # input_processor，并在后续 add_request/step 中驱动 scheduler、
+        # executor、worker 和 model runner。
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
         )
@@ -404,9 +421,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLM":
         """Create an LLM instance from EngineArgs."""
+        # 兼容已经构造好 EngineArgs 的调用方式，本质上仍走 __init__。
         return cls(**vars(engine_args))
 
     def get_tokenizer(self) -> TokenizerLike:
+        # 透传底层 engine 的 tokenizer，供调用方做自定义编码或检查词表。
         return self.llm_engine.get_tokenizer()
 
     def get_world_size(self, include_dp: bool = True) -> int:
@@ -427,10 +446,14 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         return parallel_config.world_size
 
     def reset_mm_cache(self) -> None:
+        # 清理 offline renderer 和 engine 内部的多模态缓存。适合在复用
+        # 同一个 LLM 实例、但希望释放/刷新图片等多模态处理缓存时调用。
         self.renderer.clear_mm_cache()
         self.llm_engine.reset_mm_cache()
 
     def get_default_sampling_params(self) -> SamplingParams:
+        # 从模型配置中提取“相对 vLLM 默认值有差异”的 sampling 参数，
+        # 并包装成 SamplingParams。generate/chat 未传 sampling_params 时使用。
         if self.default_sampling_params is None:
             self.default_sampling_params = self.model_config.get_diff_sampling_param()
         if self.default_sampling_params:
@@ -480,6 +503,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             A list of `RequestOutput` objects containing the
             generated completions in the same order as the input prompts.
         """
+        # generate 是最常用的 offline 文本生成入口：
+        # 1. 校验当前模型 runner 支持生成；
+        # 2. 填充默认 SamplingParams；
+        # 3. 委托 _run_completion 完成“加请求 + 跑 engine + 收结果”。
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError(
@@ -530,6 +557,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Returns:
             A list of request IDs for the enqueued requests.
         """
+        # enqueue 只把请求加入 engine，不立刻进入 step 循环。调用方可以先
+        # 批量 enqueue，再用 wait_for_completion 统一驱动执行并收结果。
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError("LLM.enqueue() is only supported for generative models.")
@@ -580,6 +609,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Returns:
             A list of output objects for all completed requests.
         """
+        # 与 enqueue 配套：这里才真正调用 _run_engine，循环执行 engine.step()
+        # 直到所有已入队请求完成。
         if output_type is None:
             output_type = (RequestOutput, PoolingRequestOutput)
 
@@ -590,6 +621,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         prompt: EngineInput,
         lora_request: LoRARequest | None,
     ) -> LoRARequest | None:
+        # 多模态模型可以为某种 modality 注册默认 LoRA。例如 prompt 中有
+        # image placeholder 且配置了 image LoRA，这里会自动补上对应
+        # LoRARequest；显式传入的 lora_request 优先级更高。
         if prompt["type"] != "multimodal":
             return lora_request
 
@@ -667,6 +701,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             and set up data-plane communication to pass data.
         """
 
+        # 面向所有 worker 的控制面 RPC。常用于模型检查、profile、权重更新
+        # 等“让每个 worker 都执行同一件事”的场景。
+        # RPC（Remote Procedure Call）就是“像调用本地函数一样，去调用另一个进程或机器上的函数”。
         return self.llm_engine.collective_rpc(method, timeout, args, kwargs)
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
@@ -680,6 +717,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             make sure you move them to CPU first to avoid taking up additional
             VRAM!
         """
+        # 在每个 worker 的真实 torch.nn.Module 上执行用户函数。适合检查
+        # 模型结构或做小型控制操作，不适合搬运大 tensor。
         return self.llm_engine.apply_model(func)
 
     def _preprocess_cmpl(
@@ -697,6 +736,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Returns:
             A list of `EngineInput` objects ready to be passed into LLMEngine.
         """
+        # completion 路径的预处理：把 PromptType 解析成模型 prompt，再通过
+        # renderer 完成 tokenization、多模态 placeholder/embedding 等输入规整。
         renderer = self.renderer
         model_config = self.model_config
 
@@ -724,6 +765,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> EngineInput:
+        # 单条 completion 预处理包装器。上层生成器逐条调用它，
+        # 可以边渲染边 add_request，避免先处理完所有 prompt 才启动 engine。
         (engine_input,) = self._preprocess_cmpl(
             [prompt],
             tokenization_kwargs,
@@ -752,6 +795,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Returns:
             A list of `EngineInput` objects ready to be passed into LLMEngine.
         """
+        # chat 路径的预处理：先根据 chat template/tool/thinking 参数把 messages
+        # 渲染成模型实际看到的 prompt，再走 tokenizer 和多模态处理。
         renderer = self.renderer
 
         chat_params = ChatParams(
@@ -801,6 +846,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> EngineInput:
+        # 单条 chat conversation 预处理包装器，作用同 _preprocess_cmpl_one。
         (engine_input,) = self._preprocess_chat(
             [conversation],
             chat_template=chat_template,
@@ -881,6 +927,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             A list of `RequestOutput` objects containing the generated
             responses in the same order as the input messages.
         """
+        # chat 是 generate 的高级封装：先把 OpenAI 风格 messages 渲染成
+        # prompt，再复用同一套“加请求 + 跑 engine”的 offline 执行路径。
         model_config = self.model_config
         runner_type = model_config.runner_type
         if runner_type != "generate":
@@ -958,6 +1006,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Returns:
             A list of request IDs for the enqueued requests.
         """
+        # enqueue_chat 对应 chat 的异步入队版本：只完成 chat 渲染和 add_request，
+        # 不在这里阻塞等待结果。
         model_config = self.model_config
         runner_type = model_config.runner_type
         if runner_type != "generate":
@@ -994,14 +1044,18 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
                            trace files will be named as "<prefix>_dp<X>_pp<Y>_tp<Z>".
                            If not provided, default naming will be used.
         """
+        # 透传到底层 engine/worker，启动 profiling trace。
         self.llm_engine.start_profile(profile_prefix)
 
     def stop_profile(self) -> None:
+        # 停止 profiling，并让底层组件 flush/保存 trace。
         self.llm_engine.stop_profile()
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        # 清空 prefix cache。可选地影响运行中请求或 KV connector；默认更偏
+        # 安全，只重置可重置的缓存状态。
         return self.llm_engine.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
@@ -1029,6 +1083,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             mode: How to handle any existing requests, can be "abort", "wait",
                 or "keep".
         """
+        # sleep 是离线场景常用的资源控制 API：level 0 只暂停调度，level 1/2
+        # 会释放更多 GPU 资源，适合模型切换或让出显存。
         self.llm_engine.sleep(level=level, mode=mode)
 
     def wake_up(self, tags: list[str] | None = None):
@@ -1044,6 +1100,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
                 (or None) before the engine is used again.
                 Use tags=["scheduling"] to resume from level 0 sleep.
         """
+        # 与 sleep 配套，按 tags 重新分配 weights、kv_cache 或 scheduling
+        # 相关资源；level 0 sleep 后可只唤醒 scheduling。
         self.llm_engine.wake_up(tags)
 
     def get_metrics(self) -> list["Metric"]:
@@ -1056,6 +1114,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Note:
             This method is only available with the V1 LLM engine.
         """
+        # 获取当前 Prometheus 聚合指标快照，用来观察吞吐、延迟、KV cache
+        # 压力等运行状态。
         return self.llm_engine.get_metrics()
 
     def _params_to_seq(
@@ -1063,6 +1123,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         params: _P | Sequence[_P],
         num_requests: int,
     ) -> Sequence[_P]:
+        # 把“单个参数对象”广播成每个请求一份；如果用户传的是列表，
+        # 则要求长度和请求数严格一致。
         if isinstance(params, Sequence):
             if len(params) != num_requests:
                 raise ValueError(
@@ -1079,6 +1141,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         lora_request: LoRARequest | None | Sequence[LoRARequest | None],
         num_requests: int,
     ) -> Sequence[LoRARequest | None]:
+        # LoRA request 和 sampling/pooling params 一样支持单值广播或逐请求传入。
         if isinstance(lora_request, Sequence):
             if len(lora_request) != num_requests:
                 raise ValueError(
@@ -1095,6 +1158,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         priority: list[int] | None,
         num_requests: int,
     ) -> Sequence[int]:
+        # priority 只在 priority scheduling policy 下生效；未传时所有请求
+        # 使用默认优先级 0。
         if priority is not None:
             if len(priority) != num_requests:
                 raise ValueError(
@@ -1119,6 +1184,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
+        # completion 入队主路径：
+        # 1. 把单 prompt/单 params/单 LoRA 统一成序列；
+        # 2. 懒加载式逐条 render prompt；
+        # 3. 交给 _render_and_add_requests 加入 engine。
         seq_prompts = prompt_to_seq(prompts)
         seq_params = self._params_to_seq(params, len(seq_prompts))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_prompts))
@@ -1156,6 +1225,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ):
+        # generate/pooling 的同步执行封装：先入队，再启动 engine step 循环。
         self._add_completion_requests(
             prompts=prompts,
             params=params,
@@ -1187,6 +1257,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ):
+        # chat 的同步执行封装：先把 messages 入队为 engine requests，再跑 engine。
         self._add_chat_requests(
             messages=messages,
             params=params,
@@ -1223,6 +1294,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
+        # chat 入队主路径：把 conversations、params、LoRA、priority 统一成
+        # 等长序列，然后逐条渲染 conversation 并加入 engine。
         seq_convs = conversation_to_seq(messages)
         seq_params = self._params_to_seq(params, len(seq_convs))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_convs))
@@ -1279,6 +1352,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         This is a no-op for models whose structured tokens are regular
         text tokens (e.g. DeepSeek's ``<think>``/``</think>``).
         """
+        # 当模型把 reasoning/tool-call 语法注册为 special tokens 时，默认的
+        # skip_special_tokens=True 会把这些结构标记删掉，导致后处理无法解析。
+        # 这里只对已知需要保留这些 token 的 Gemma4 做定向修正。
         # The offline API currently lacks a unified rendering pipeline.
         # Until the planned Renderer refactor is complete, we hardcode
         # this token preservation logic specifically for Gemma4 models
@@ -1320,6 +1396,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         priorities: Sequence[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
     ):
+        # 早期/通用的“render + run”组合工具。现在更推荐传 generator，
+        # 让渲染和 add_request 交错进行，减少首次请求启动等待。
         if isinstance(prompts, (list, tuple)):
             logger.warning_once(
                 "Rendering all prompts before adding them to the engine "
@@ -1347,6 +1425,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         lora_requests: Sequence[LoRARequest | None] | None = None,
         priorities: Sequence[int] | None = None,
     ) -> list[str]:
+        # 将已经渲染好的 EngineInput 逐条加入 LLMEngine。若中途失败，
+        # 会 abort 已经加入的请求，避免 engine 内留下半批残留请求。
         added_request_ids: list[str] = []
 
         try:
@@ -1375,6 +1455,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         lora_request: LoRARequest | None = None,
         priority: int = 0,
     ) -> str:
+        # 单请求入队的最底层 wrapper：生成 request_id，设置 offline API
+        # 只关心最终输出，然后调用 LLMEngine.add_request。
         if isinstance(params, SamplingParams):
             # We only care about the final output
             params.output_kind = RequestOutputKind.FINAL_ONLY
@@ -1395,6 +1477,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> list[_O]:
+        # offline LLM 的核心执行循环：不断调用 llm_engine.step()，每一步由
+        # engine 内部完成 scheduling、model execution、sampling 和输出处理。
+        # 这里收集 finished outputs，并最终按 request_id 恢复输入顺序。
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -1453,6 +1538,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Args:
             request: Weight transfer initialization request with backend-specific info
         """
+        # RLHF/在线训练场景会把训练侧权重同步到 vLLM 推理侧。这里先在所有
+        # worker 上初始化对应的 weight transfer backend。
         init_info_dict = (
             request["init_info"] if isinstance(request, dict) else request.init_info
         )
@@ -1470,6 +1557,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
                 format (need layerwise processing) or kernel format (direct
                 copy).
         """
+        # 通知所有 worker 进入一次新的权重更新流程，后续 update_weights
+        # 会传入具体更新信息。
         self.llm_engine.collective_rpc(
             "start_weight_update",
             kwargs={"is_checkpoint_format": is_checkpoint_format},
@@ -1482,6 +1571,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         Args:
             request: Weight update request with backend-specific update info
         """
+        # 把训练侧或外部系统提供的权重更新信息广播给所有 worker，
+        # 由各自的 weight transfer backend 完成实际加载/拷贝。
         update_info_dict = (
             request["update_info"] if isinstance(request, dict) else request.update_info
         )
@@ -1494,10 +1585,13 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         """
         Finish the current weight update.
         """
+        # 结束本轮权重更新，通常用于让 worker 做收尾同步或状态切换。
         self.llm_engine.collective_rpc("finish_weight_update")
 
     def __repr__(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
+        # __repr__ 会跨 worker 查询模型结构，代价比普通字符串拼接高；
+        # 因此第一次查询后缓存结果，后续直接返回。
         # Cache the result to avoid repeated collective_rpc calls
         if self._cached_repr is None:
             results = self.llm_engine.collective_rpc("get_model_inspection")

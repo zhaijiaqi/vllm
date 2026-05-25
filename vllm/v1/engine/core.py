@@ -1,5 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# 本文件是 vLLM V1 引擎的后端核心实现，位于 AsyncLLM/EngineCoreClient
+# 之后，负责真正驱动 scheduler、executor、worker/model runner 完成一轮轮
+# 推理迭代。
+#
+# 在整体链路中的定位：
+# - api_server.py 创建 AsyncLLM，并把 HTTP/OpenAI 请求交给 EngineClient；
+# - async_llm.py 把请求转成 EngineCoreRequest，通过 EngineCoreClient 发往
+#   后端 EngineCore，并把输出重新分发成每个请求自己的 async stream；
+# - core.py 接收这些 EngineCoreRequest，进行请求预处理、调度、模型执行、
+#   输出生成、控制面操作，并通过 ZMQ/队列把 EngineCoreOutputs 发回前台。
+#
+# 请求进入的核心流程：
+# EngineCoreClient/ZMQ 输入 socket
+#   -> EngineCoreProc.process_input_sockets()
+#   -> preprocess_add_request() 将 EngineCoreRequest 转成内部 Request
+#   -> input_queue
+#   -> run_busy_loop()
+#   -> _handle_client_request()
+#   -> add_request()
+#   -> scheduler.add_request()。
+#
+# 推理执行的核心流程：
+# run_busy_loop()
+#   -> _process_input_queue() 先处理前台请求/控制指令
+#   -> _process_engine_step()
+#   -> step()/step_with_batch_queue()
+#   -> scheduler.schedule()
+#   -> model_executor.execute_model()
+#   -> scheduler.update_from_output()
+#   -> EngineCoreOutputs 放入 output_queue。
+#
+# 输出回流的核心流程：
+# output_queue
+#   -> EngineCoreProc.process_output_sockets()
+#   -> msgpack 序列化 EngineCoreOutputs
+#   -> ZMQ PUSH 给 EngineCoreClient
+#   -> async_llm.py 的 output_handler 拉取并交给 OutputProcessor
+#   -> 对应请求的 RequestOutputCollector queue
+#   -> generate()/encode() yield 给 OpenAI serving 层。
+#
+# 本文件还包含数据并行/MoE 的 DPEngineCoreProc、elastic EP 扩缩容流程，
+# 以及 Ray actor 场景下运行 EngineCore 的包装类。
 import gc
 import os
 import queue
@@ -93,6 +136,15 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
+
+    # EngineCore 负责真正的一轮轮推理逻辑：创建 executor、KV cache、scheduler 和运行态队列。
+    # 核心方法：
+    # step()
+    # step_with_batch_queue()
+    # add_request()
+    # abort_requests()
+    # preprocess_add_request()
+    # pause_scheduler()
 
     def __init__(
         self,
@@ -231,6 +283,7 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+    # 根据模型 profile 结果创建 KV cache 配置，并初始化/warmup executor。
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
@@ -312,9 +365,11 @@ class EngineCore:
             )
         return scheduler_kv_cache_config
 
+    # 返回当前模型 executor 支持的任务类型。
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    # 返回 scheduler KV cache group 的可序列化元数据。
     def get_kv_cache_group_metadata(self) -> list[dict[str, int | str | None]]:
         """Return msgspec-serializable metadata for scheduler KV cache groups."""
         kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
@@ -334,6 +389,7 @@ class EngineCore:
             )
         return metadata
 
+    # 校验内部 Request，并把它加入 scheduler 的等待/运行队列。
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -371,6 +427,7 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
+    # 将请求标记为 aborted，让 scheduler 后续清理并产出结束状态。
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -379,6 +436,7 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    # 包裹模型执行阶段，失败时 dump scheduler/engine 细节辅助排查。
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -395,6 +453,7 @@ class EngineCore:
             )
             raise err
 
+    # 可选地记录每轮调度/执行的请求数、token 数和耗时。
     @contextmanager
     def log_iteration_details(self, scheduler_output: SchedulerOutput):
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
@@ -425,6 +484,7 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    # 执行一轮标准引擎迭代：调度、模型执行、采样、更新 scheduler。
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -456,6 +516,7 @@ class EngineCore:
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    # 每轮 step 后处理 speculative decode 等需要回写 scheduler 的状态。
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
@@ -466,6 +527,7 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    # 使用 batch queue 执行流水并行场景下的异步调度/执行。
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -584,6 +646,7 @@ class EngineCore:
 
         return engine_core_outputs, model_executed
 
+    # 批量处理模型执行期间收到的 abort 请求，避免请求泄漏。
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
             request_ids = []
@@ -594,6 +657,7 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
+    # 关闭 structured output、executor、scheduler，并释放分布式/GC 资源。
     def shutdown(self):
         self.structured_output_manager.clear_backend()
         if self.model_executor:
@@ -610,9 +674,11 @@ class EngineCore:
         # before it exits and release cached memory.
         cleanup_dist_env_and_memory()
 
+    # 开启或停止底层 executor 的 profiling。
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 
+    # 清理多模态缓存，包括 EngineCore 侧 receiver cache 和 executor cache。
     def reset_mm_cache(self):
         # NOTE: Since this is mainly for debugging, we don't attempt to
         # re-sync the internal caches (P0 sender, P1 receiver)
@@ -628,6 +694,7 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
+    # 重置 scheduler 维护的 prefix cache 状态。
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -635,6 +702,7 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    # 重置 encoder cache，避免权重更新后复用旧视觉/encoder 输出。
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
@@ -655,11 +723,13 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
+    # 一次性重置 prefix、多模态和 encoder 三类缓存。
     def _reset_caches(self, reset_running_requests=True) -> None:
         self.reset_prefix_cache(reset_running_requests=reset_running_requests)
         self.reset_mm_cache()
         self.reset_encoder_cache()
 
+    # 暂停 scheduler；inproc 模式下直接设置暂停态并可选清缓存。
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> Future | None:
@@ -691,14 +761,17 @@ class EngineCore:
 
         return None
 
+    # 恢复 scheduler，并放行暂停期间排队的新请求。
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
 
+    # 查询 scheduler 当前是否处于任意暂停状态。
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
+    # 让引擎进入 sleep 状态：先暂停调度，再按 level 释放/迁移资源。
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Put the engine to sleep at the specified level.
 
@@ -737,6 +810,7 @@ class EngineCore:
         pause_future.add_done_callback(pause_complete)
         return future
 
+    # 唤醒 executor，并恢复 scheduler 调度。
     def wake_up(self, tags: list[str] | None = None):
         """Wake up the engine from sleep.
 
@@ -753,25 +827,32 @@ class EngineCore:
         # Resume scheduling (applies to all levels)
         self.resume_scheduler()
 
+    # 查询 scheduler 或 executor 是否处于 sleep/paused 状态。
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
+    # 执行一个 dummy batch，常用于 DP 同步或保持执行路径对齐。
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 
+    # 在 executor/worker 中加载 LoRA adapter。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
 
+    # 从 executor/worker 中移除 LoRA adapter。
     def remove_lora(self, lora_id: int) -> bool:
         return self.model_executor.remove_lora(lora_id)
 
+    # 列出 executor/worker 当前已加载的 LoRA adapter。
     def list_loras(self) -> set[int]:
         return self.model_executor.list_loras()
 
+    # 固定指定 LoRA adapter，避免被驱逐。
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
 
+    # 保存 executor/worker 持有的分片权重状态。
     def save_sharded_state(
         self,
         path: str,
@@ -782,6 +863,7 @@ class EngineCore:
             path=path, pattern=pattern, max_size=max_size
         )
 
+    # 在底层 worker 上执行 collective RPC。
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -791,6 +873,7 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    # 将前台 EngineCoreRequest 转成 scheduler 使用的内部 Request。
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
@@ -815,9 +898,11 @@ class EngineCore:
             self.structured_output_manager.grammar_init(req)
         return req, request.current_wave
 
+    # elastic EP scale-up 在 KV cache 初始化前的准备钩子；基类不实现。
     def _eep_scale_up_before_kv_init(self):
         raise NotImplementedError
 
+    # 向 EngineCoreClient 发送 elastic EP 相关通知；基类不实现。
     def _eep_send_engine_core_notification(
         self,
         notification_type: EEPNotificationType,
@@ -826,6 +911,7 @@ class EngineCore:
         raise NotImplementedError
 
 
+# EngineCoreProc 的 shutdown 状态机。
 class EngineShutdownState(IntEnum):
     RUNNING = 0
     REQUESTED = 1
@@ -838,6 +924,7 @@ class EngineCoreProc(EngineCore):
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
 
+    # EngineCoreProc 负责初始化后台 EngineCore 进程运行所需要的东西：完成握手、建 ZMQ IO 线程，再初始化核心。
     @instrument(span_name="EngineCoreProc init")
     def __init__(
         self,
@@ -947,6 +1034,7 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
+    # 根据 DP/多 API server 拓扑执行一次或两次启动握手，拿到 ZMQ 地址。
     @contextmanager
     def _perform_handshakes(
         self,
@@ -1012,6 +1100,7 @@ class EngineCoreProc(EngineCore):
         # Update config which may have changed from the handshake
         vllm_config.__post_init__()
 
+    # 和一个前台/协调进程完成 HELLO/INIT/READY 握手。
     @contextmanager
     def _perform_handshake(
         self,
@@ -1051,6 +1140,7 @@ class EngineCoreProc(EngineCore):
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
+    # 发送 HELLO，并接收前台返回的 Engine ZMQ 地址和并行配置更新。
     @staticmethod
     def startup_handshake(
         handshake_socket: zmq.Socket,
@@ -1089,6 +1179,7 @@ class EngineCoreProc(EngineCore):
 
         return init_message.addresses
 
+    # 子进程入口：选择普通或 DP EngineCoreProc，并运行 busy loop。
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
@@ -1175,9 +1266,11 @@ class EngineCoreProc(EngineCore):
             if engine_core is not None:
                 engine_core.shutdown()
 
+    # 普通 EngineCoreProc 不需要额外初始化数据并行进程组。
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
+    # 判断当前是否需要继续执行 engine step。
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
         return (
@@ -1186,10 +1279,12 @@ class EngineCoreProc(EngineCore):
             or bool(self.batch_queue)
         )
 
+    # 判断是否还未收到 shutdown 请求。
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
+    # 后台进程主循环：处理输入队列，然后执行引擎 step 并产出输出。
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
         while self._handle_shutdown():
@@ -1200,6 +1295,7 @@ class EngineCoreProc(EngineCore):
 
         raise SystemExit
 
+    # 从 input_queue 取前台请求，直到需要执行一次 engine step。
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
@@ -1231,6 +1327,7 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+    # 执行一次 step_fn，并把 EngineCoreOutputs 放入输出队列。
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
@@ -1250,11 +1347,13 @@ class EngineCoreProc(EngineCore):
 
         return model_executed
 
+    # 引擎进入 idle 时触发等待 idle 的回调，例如 pause future。
     def _notify_idle_state_callbacks(self) -> None:
         while self._idle_state_callbacks:
             callback = self._idle_state_callbacks.pop()
             callback(self)
 
+    # 处理 shutdown 状态机：请求停止、排空/中止请求、最终退出循环。
     def _handle_shutdown(self) -> bool:
         # Check if shutdown was requested and handle it
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1291,6 +1390,7 @@ class EngineCoreProc(EngineCore):
 
         return True
 
+    # 分发 input_queue 中的客户端请求类型：ADD/ABORT/UTILITY/WAKEUP 等。
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
@@ -1326,6 +1426,7 @@ class EngineCoreProc(EngineCore):
                 "Unrecognized input request type encountered: %s", request_type
             )
 
+    # shutdown 期间拒绝新 ADD 请求，并向对应客户端发送 abort 输出。
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
             return False
@@ -1334,6 +1435,7 @@ class EngineCoreProc(EngineCore):
         self._send_abort_outputs_to_client([request.request_id], request.client_index)
         return True
 
+    # shutdown 期间拒绝 utility 调用，并返回失败的 UtilityOutput。
     def _reject_utility_in_shutdown(
         self, client_idx: int, call_id: int, method_name: str
     ) -> bool:
@@ -1347,6 +1449,7 @@ class EngineCoreProc(EngineCore):
         )
         return True
 
+    # 执行 utility 方法，并把同步/异步 Future 结果统一写回输出队列。
     @staticmethod
     def _invoke_utility_method(
         name: str, get_result: Callable, output: UtilityOutput, enqueue_output: Callable
@@ -1366,6 +1469,7 @@ class EngineCoreProc(EngineCore):
             output.failure_message = f"Call to {name} method failed: {str(e)}"
         enqueue_output(output)
 
+    # 将 msgpack 解出的普通对象按目标方法签名转换成 msgspec Struct。
     @staticmethod
     def _convert_msgspec_args(method, args):
         """If a provided arg type doesn't match corresponding target method
@@ -1383,6 +1487,7 @@ class EngineCoreProc(EngineCore):
             for v, p in zip(args, arg_types)
         )
 
+    # 向前台发送 EngineCore 已死亡信号，并等待输出线程发送完成。
     def _send_engine_dead(self):
         """Send EngineDead status to the EngineCoreClient."""
 
@@ -1397,6 +1502,7 @@ class EngineCoreProc(EngineCore):
                 "to send. Please report this issue."
             )
 
+    # 输入 IO 线程：从 ZMQ socket 收消息，反序列化后推入 input_queue。
     def process_input_sockets(
         self,
         input_addresses: list[str],
@@ -1492,6 +1598,7 @@ class EngineCoreProc(EngineCore):
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 
+    # 输出 IO 线程：从 output_queue 取结果，序列化后通过 ZMQ 发给前台。
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
     ):
@@ -1559,6 +1666,7 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
+    # 处理输入线程中的 ADD 预处理异常，返回 request 级错误输出。
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
         from the add request preprocessing in the input socket processing thread.
@@ -1568,6 +1676,7 @@ class EngineCoreProc(EngineCore):
         )
         self._send_error_outputs_to_client([request.request_id], request.client_index)
 
+    # 进程模式下暂停 scheduler；必要时等待输出队列/请求排空后完成 Future。
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> Future | None:
@@ -1610,6 +1719,7 @@ class EngineCoreProc(EngineCore):
         self._idle_state_callbacks.append(partial(engine_idle_callback, future=future))
         return future
 
+    # 判断 pause 是否已经完全完成，可以同步返回。
     def _pause_complete(self) -> bool:
         """Returns True if the pause has fully completed and the caller can
         return ``None`` synchronously; False if the pause is still pending
@@ -1617,6 +1727,7 @@ class EngineCoreProc(EngineCore):
         """
         return not self.has_work()
 
+    # 构造 finish 输出并写入指定 client 的输出队列。
     def _send_finish_outputs_to_client(
         self, req_ids: list[str], client_index: int, finish_reason: FinishReason
     ) -> None:
@@ -1627,16 +1738,19 @@ class EngineCoreProc(EngineCore):
         eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
         self.output_queue.put_nowait((client_index, eco))
 
+    # 向指定 client 发送 abort 结束输出。
     def _send_abort_outputs_to_client(
         self, req_ids: list[str], client_index: int
     ) -> None:
         self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ABORT)
 
+    # 向指定 client 发送 error 结束输出。
     def _send_error_outputs_to_client(
         self, req_ids: list[str], client_index: int
     ) -> None:
         self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ERROR)
 
+    # 将 scheduler 返回的 aborted 请求按 client 分组并发送 abort 输出。
     def _send_abort_outputs(self, aborted_reqs: list[tuple[str, int]]) -> None:
         # TODO(nick) this will be moved inside the scheduler
         if aborted_reqs:
@@ -1652,6 +1766,7 @@ class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
     in a data parallel context."""
 
+    # 初始化 MoE 数据并行 EngineCore，并准备 wave/pause/elastic EP 状态。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1697,6 +1812,7 @@ class DPEngineCoreProc(EngineCoreProc):
             tensor_queue=tensor_queue,
         )
 
+    # 初始化数据并行 rank、size 和 stateless DP process group。
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
         parallel_config = vllm_config.parallel_config
@@ -1713,11 +1829,13 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
+    # 关闭基础资源后销毁 DP process group。
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
+    # DP 场景下的两阶段 pause：先本地挂起，再等待所有 rank 达成共识。
     def _pause_complete(self) -> bool:
         """Two-phase DP-aware pause.
 
@@ -1736,6 +1854,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return False
 
+    # 添加请求后根据 request wave 决定是否启动/推进 DP wave。
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
         if self.has_coordinator and request_wave != self.current_wave:
@@ -1752,6 +1871,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
+    # 恢复 DP scheduler，并在所有 rank 同步后按需重启 engine loop。
     def resume_scheduler(self):
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
@@ -1777,12 +1897,14 @@ class DPEngineCoreProc(EngineCoreProc):
         if has_global_unfinished:
             self.engines_running = True
 
+    # 测试工具：在 DP process group 上执行阻塞 barrier。
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
         import torch.distributed as dist
 
         dist.barrier(group=self.dp_group)
 
+    # 处理 DP 专属 START_DP_WAVE 请求，其余请求交给父类。
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
@@ -1803,6 +1925,7 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             super()._handle_client_request(request_type, request)
 
+    # 向 DP coordinator 发布本 rank 的请求数量和 wave 统计。
     def _maybe_publish_request_counts(self):
         if not self.publish_dp_lb_stats:
             return
@@ -1816,6 +1939,7 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    # DP 主循环：处理输入、执行/补 dummy batch、跨 rank 同步 wave 完成状态。
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 
@@ -1874,6 +1998,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
+    # 周期性 all-reduce，判断全局是否还有未完成请求或 pause 共识。
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
@@ -1893,6 +2018,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return has_unfinished
 
+    # 接收 elastic EP 重配置请求，并启动扩缩容状态机。
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
     ) -> None:
@@ -1941,6 +2067,7 @@ class DPEngineCoreProc(EngineCoreProc):
             "[Elastic EP] Received reconfiguration request and starting scaling up/down"
         )
 
+    # 向 EngineCoreClient 发送 elastic EP 扩缩容通知。
     def _eep_send_engine_core_notification(
         self,
         notification_type: EEPNotificationType,
@@ -1981,6 +2108,7 @@ class DPEngineCoreProc(EngineCoreProc):
             ):
                 socket.send_multipart(encoder.encode(outputs))
 
+    # 处理 EngineCoreClient 转发来的 elastic EP 通知。
     def eep_handle_engine_core_notification(
         self, notification_type: str | EEPNotificationType
     ):
@@ -1993,6 +2121,7 @@ class DPEngineCoreProc(EngineCoreProc):
             notification_type = EEPNotificationType(notification_type)
         self.eep_scaling_state.handle_notification(notification_type)
 
+    # 新增 EngineCore 在 KV cache 初始化前执行 elastic EP scale-up 准备。
     def _eep_scale_up_before_kv_init(self):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
@@ -2014,6 +2143,7 @@ class EngineCoreActorMixin:
     Ray actor for running EngineCore in a data parallel context
     """
 
+    # 初始化 Ray actor 运行环境：tracing、地址、rank 和可见设备。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2053,6 +2183,7 @@ class EngineCoreActorMixin:
         # of ray.
         self._set_visible_devices(vllm_config, local_dp_rank)
 
+    # Ray actor 内补齐 NIXL side channel host 环境变量。
     @staticmethod
     def _set_nixl_side_channel_host():
         import ray
@@ -2063,6 +2194,7 @@ class EngineCoreActorMixin:
             "VLLM_NIXL_SIDE_CHANNEL_HOST", ray.util.get_node_ip_address()
         )
 
+    # 根据平台设置当前 actor 可见的设备集合。
     def _set_visible_devices(self, vllm_config: VllmConfig, local_dp_rank: int):
         from vllm.platforms import current_platform
 
@@ -2074,6 +2206,7 @@ class EngineCoreActorMixin:
                 vllm_config, local_dp_rank, device_control_env_var
             )
 
+    # 设置 CUDA_VISIBLE_DEVICES 或等价环境变量。
     def _set_cuda_visible_devices(
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str
     ):
@@ -2092,6 +2225,7 @@ class EngineCoreActorMixin:
                 f'base value: "{os.getenv(device_control_env_var)}"'
             ) from e
 
+    # Ray 场景地址已由 launcher 提供，因此握手阶段直接产出地址。
     @contextmanager
     def _perform_handshakes(
         self,
@@ -2108,6 +2242,7 @@ class EngineCoreActorMixin:
         """
         yield self.addresses
 
+    # Ray actor 初始化完成标记方法，供 ray.get() 等待。
     def wait_for_init(self):
         """
         Wait until the engine core is initialized.
@@ -2118,6 +2253,7 @@ class EngineCoreActorMixin:
         """
         pass
 
+    # Ray actor 运行入口：执行 EngineCore busy loop 并负责最终 shutdown。
     def run(self):
         """
         Run the engine core busy loop.
@@ -2137,6 +2273,7 @@ class EngineCoreActorMixin:
 class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
     """Used for MoE model data parallel cases."""
 
+    # Ray actor 版本的 MoE 数据并行 EngineCore。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2160,6 +2297,8 @@ class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
 class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):
     """Used for non-MoE and/or non-DP cases."""
 
+    # Ray actor 版本的普通 EngineCore。
+    # 继承于 EngineCoreProc->EngineCore，仍然有 EngineCore 的核心能力，但它额外加了 Ray actor 运行所需的东西。
     def __init__(
         self,
         vllm_config: VllmConfig,

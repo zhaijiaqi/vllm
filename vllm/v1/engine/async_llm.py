@@ -1,5 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# 本文件是 vLLM V1 在线 serving 路径里的异步 engine client。
+#
+# AsyncLLM 面向把每个在线请求异步提交给后台 EngineCore，
+# 再把后端持续产生的结果按 request_id 分发回
+# 对应的 async generator。
+#
+# 为什么需要这一层：
+# - 在线服务中会有多个请求同时进入，每个请求都可能要求流式返回；
+# - HTTP 客户端可能中途断开，因此需要把取消传播到底层 EngineCore；
+# - EngineCore 通常运行在后台进程/worker 拓扑中，API server 不能阻塞在
+#   同步推理循环里；
+# - 后端产出是全局输出流，但 OpenAI serving 层需要看到“每个请求自己的”
+#   输出流；
+# - serving 还需要统一暴露 health check、abort、pause/resume、LoRA、cache、
+#   profiling、elastic EP 和 weight update 等控制面能力。
+#
+# 请求进入的核心流程：
+# api_server.py/FastAPI handler
+#   -> engine_client.generate()/encode()
+#   -> AsyncLLM.generate()/encode()
+#   -> add_request()
+#   -> InputProcessor.process_inputs() 将 prompt/params 转成 EngineCoreRequest
+#   -> _add_request() 先在 OutputProcessor 登记请求队列
+#   -> EngineCoreClient.add_request_async() 提交给后台 EngineCore。
+#
+# 输出回流的核心流程：
+# EngineCore 产生 EngineCoreOutputs
+#   -> _run_output_handler() 后台 task 持续 get_output_async()
+#   -> OutputProcessor.process_outputs() 转成 RequestOutput/PoolingRequestOutput
+#   -> 放入对应 RequestOutputCollector queue
+#   -> generate()/encode() 从 queue 取出并 yield 给 OpenAI serving 层
+#   -> api_server.py 再将其转成 SSE/JSON HTTP 响应。
 import asyncio
 import os
 import socket
@@ -62,6 +95,7 @@ class InputStreamError(Exception):
     without wrapping them in EngineGenerateError.
     """
 
+    # 保存输入流生成器的原始异常，方便 generate() 原样抛回给调用方。
     def __init__(self, cause: Exception):
         self.cause = cause
         super().__init__(str(cause))
@@ -70,6 +104,7 @@ class InputStreamError(Exception):
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
 
+    # 初始化异步前台对象，并连接后台 EngineCore 进程。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -199,6 +234,7 @@ class AsyncLLM(EngineClient):
         else:
             self.profiler = None
 
+    # 调用方已经持有完整 VllmConfig 时，通过该工厂方法创建 AsyncLLM。
     @classmethod
     def from_vllm_config(
         cls,
@@ -228,6 +264,7 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
         )
 
+    # 从 CLI/server 参数先生成配置，再创建 AsyncLLM。
     @classmethod
     def from_engine_args(
         cls,
@@ -253,9 +290,11 @@ class AsyncLLM(EngineClient):
             stat_loggers=stat_loggers,
         )
 
+    # 兜底清理：调用方没有显式 shutdown 时尽量释放资源。
     def __del__(self):
         self.shutdown()
 
+    # 关闭前台资源、EngineCore 客户端和后台输出任务。
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown, cleaning up the background proc and IPC."""
         shutdown_prometheus()
@@ -270,6 +309,7 @@ class AsyncLLM(EngineClient):
         if handler is not None:
             cancel_task_threadsafe(handler)
 
+    # 查询并缓存当前模型/引擎支持的任务类型。
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
             # Cache the result
@@ -277,6 +317,7 @@ class AsyncLLM(EngineClient):
 
         return self._supported_tasks
 
+    # 校验并规范化一个前台请求，然后注册到引擎侧。
     async def add_request(
         self,
         request_id: str,
@@ -397,6 +438,7 @@ class AsyncLLM(EngineClient):
             )
         return queue
 
+    # 先在本进程登记请求状态，再把请求提交给 EngineCore。
     async def _add_request(
         self,
         request: EngineCoreRequest,
@@ -414,6 +456,7 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
 
+    # 处理流式输入：把每个输入分片转换成可续写的引擎请求。
     async def _add_streaming_input_request(
         self,
         request_id: str,
@@ -455,6 +498,7 @@ class AsyncLLM(EngineClient):
 
         queue = RequestOutputCollector(sampling_params.output_kind, internal_req_id)
 
+        # 后台消费调用方提供的输入流，并持续向同一个内部请求追加输入。
         async def handle_inputs():
             cancelled = False
             try:
@@ -500,6 +544,7 @@ class AsyncLLM(EngineClient):
         queue._input_stream_task = asyncio.create_task(handle_inputs())
         return queue
 
+    # 检查流式输入当前支持范围，提前拒绝不支持的参数组合。
     @staticmethod
     def _validate_streaming_input_sampling_params(
         params: SamplingParams | PoolingParams,
@@ -521,6 +566,7 @@ class AsyncLLM(EngineClient):
     # requests we don't need to send multiple messages to core proc,
     # and so we don't need multiple streams which then get
     # re-multiplexed in the API server anyhow.
+    # 对外的异步生成接口：提交请求，并逐步 yield 输出流。
     async def generate(
         self,
         prompt: EngineCoreRequest
@@ -634,6 +680,7 @@ class AsyncLLM(EngineClient):
             if q is not None:
                 q.close()
 
+    # 启动唯一的后台任务，把 EngineCore 输出分发到各请求队列。
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
 
@@ -653,6 +700,7 @@ class AsyncLLM(EngineClient):
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 
+        # 持续拉取 EngineCore 输出，并通过 OutputProcessor 分发到请求队列。
         async def output_handler():
             try:
                 while True:
@@ -706,6 +754,7 @@ class AsyncLLM(EngineClient):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    # 同时在前台输出状态和 EngineCore 中取消请求。
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
     ) -> None:
@@ -720,6 +769,7 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
+    # 通知 KV-transfer 连接器某请求被拒绝，以便释放预占资源。
     async def notify_kv_transfer_request_rejected(
         self,
         request_id: str,
@@ -747,6 +797,7 @@ class AsyncLLM(EngineClient):
         )
         await self.engine_core.add_request_async(request)
 
+    # 暂停调度器接收/执行请求，常用于权重更新等维护操作前。
     async def pause_generation(
         self,
         *,
@@ -792,14 +843,17 @@ class AsyncLLM(EngineClient):
         # of events from caller's pov.
         await asyncio.sleep(0.02)
 
+    # 恢复此前暂停的调度器接收/执行流程。
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
         await self.engine_core.resume_scheduler_async()
 
+    # 查询后端调度器当前是否处于暂停状态。
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()
 
+    # 对外的异步 pooling/embedding 接口，结构与 generate() 平行。
     async def encode(
         self,
         prompt: PromptType | EngineInput,
@@ -883,41 +937,50 @@ class AsyncLLM(EngineClient):
             if q is not None:
                 q.close()
 
+    # 暴露 renderer 持有的 tokenizer，兼容 EngineClient 调用方。
     @property
     def tokenizer(self) -> TokenizerLike | None:
         return self.renderer.tokenizer
 
+    # 返回实际 tokenizer；如果不可用，由 renderer 内部抛错。
     def get_tokenizer(self) -> TokenizerLike:
         return self.renderer.get_tokenizer()
 
+    # 告诉调用方当前是否需要附加请求 tracing 信息。
     async def is_tracing_enabled(self) -> bool:
         return self.observability_config.otlp_traces_endpoint is not None
 
+    # 输出/刷新前台与引擎侧累计的统计信息。
     async def do_log_stats(self) -> None:
         if self.logger_manager:
             self.logger_manager.log()
 
+    # serving 层使用的轻量健康检查。
     async def check_health(self) -> None:
         logger.debug("Called check_health.")
         if self.errored:
             raise self.dead_error
 
+    # 同时启动 EngineCore profiling 和可选的前台 torch profiler。
     async def start_profile(self, profile_prefix: str | None = None) -> None:
         coros = [self.engine_core.profile_async(True, profile_prefix)]
         if self.profiler is not None:
             coros.append(asyncio.to_thread(self.profiler.start))
         await asyncio.gather(*coros)
 
+    # 同时停止 EngineCore profiling 和可选的前台 torch profiler。
     async def stop_profile(self) -> None:
         coros = [self.engine_core.profile_async(False)]
         if self.profiler is not None:
             coros.append(asyncio.to_thread(self.profiler.stop))
         await asyncio.gather(*coros)
 
+    # 清理 renderer 和后端引擎中的多模态缓存。
     async def reset_mm_cache(self) -> None:
         await self.renderer.clear_mm_cache_async()
         await self.engine_core.reset_mm_cache_async()
 
+    # 重置 EngineCore 中的 prefix cache 状态。
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -925,9 +988,11 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    # 重置 EngineCore 中 encoder 侧缓存状态。
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    # 让引擎进入低资源 sleep 状态，并记录对应指标。
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()
@@ -936,31 +1001,38 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, level)
 
+    # 从 sleep 状态唤醒引擎，并记录对应指标。
     async def wake_up(self, tags: list[str] | None = None) -> None:
         await self.engine_core.wake_up_async(tags)
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    # 查询 EngineCore 当前是否处于 sleep 状态。
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 
+    # 向 EngineCore 加载 LoRA adapter，供后续请求使用。
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         return await self.engine_core.add_lora_async(lora_request)
 
+    # 从 EngineCore 移除已加载的 LoRA adapter。
     async def remove_lora(self, lora_id: int) -> bool:
         """Remove an already loaded LoRA adapter."""
         return await self.engine_core.remove_lora_async(lora_id)
 
+    # 返回 EngineCore 当前已知的 LoRA adapter id 集合。
     async def list_loras(self) -> set[int]:
         """List all registered adapters."""
         return await self.engine_core.list_loras_async()
 
+    # 固定某个 LoRA adapter，避免被 EngineCore 驱逐。
     async def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
+    # 在后端 worker 上执行一次 collective RPC 调用。
     async def collective_rpc(
         self,
         method: str,
@@ -975,6 +1047,7 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    # 轮询数据并行引擎，直到所有进行中的请求排空。
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()
@@ -991,6 +1064,7 @@ class AsyncLLM(EngineClient):
             "waiting for requests to drain."
         )
 
+    # 调整 elastic EP / 数据并行后端容量。
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
@@ -1041,23 +1115,28 @@ class AsyncLLM(EngineClient):
         finally:
             set_scaling_elastic_ep(False)
 
+    # 输出处理任务尚未失败或停止时，认为 AsyncLLM 仍在运行。
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
         return self.output_handler is None or not self.output_handler.done()
 
+    # EngineClient 兼容属性：用 errored 表示停止/不可用状态。
     @property
     def is_stopped(self) -> bool:
         return self.errored
 
+    # EngineCore 已死亡或输出处理任务失败时，认为引擎出错。
     @property
     def errored(self) -> bool:
         return self.engine_core.resources.engine_dead or not self.is_running
 
+    # 引擎不可用时对外抛出的标准异常。
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
 
+    # 初始化后端权重传输组件，供 RL/training 流程使用。
     async def init_weight_transfer_engine(
         self, request: WeightTransferInitRequest
     ) -> None:
@@ -1080,6 +1159,7 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
+    # 标记一次后端权重更新事务开始。
     async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
         """Start a new weight update."""
         await self.collective_rpc(
@@ -1087,6 +1167,7 @@ class AsyncLLM(EngineClient):
             kwargs={"is_checkpoint_format": is_checkpoint_format},
         )
 
+    # 通过后端权重传输组件应用一批权重更新。
     async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
         """
         Batched weight update for RL training.
@@ -1106,6 +1187,7 @@ class AsyncLLM(EngineClient):
             "update_weights", kwargs={"update_info": update_info_dict}
         )
 
+    # 标记当前后端权重更新事务结束。
     async def finish_weight_update(self) -> None:
         """Finish the current weight update."""
         await self.collective_rpc("finish_weight_update")

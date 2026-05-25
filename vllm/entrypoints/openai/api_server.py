@@ -1,5 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""OpenAI-compatible online serving entrypoint.
+
+这个文件是 vLLM 在线推理服务的“启动和装配层”。离线推理是 Python 代码直接创建
+`LLM` 并调用 `generate()`，
+而在线推理是先启动一个常驻 HTTP server，再让外部客户端通过 HTTP 请求访问模型。
+
+所谓 OpenAI-compatible API，是指 vLLM 模仿 OpenAI 的 HTTP 接口格式，
+例如 `/v1/chat/completions`、`/v1/completions`、`/v1/models`。这样原本
+调用 OpenAI SDK 的应用，只要把 `base_url` 指到 vLLM server，就可以调用
+你自己部署的模型。
+
+模型通常仍在运行 `vllm serve ...` 的本机或服务器上：API server 接收
+HTTP 请求，FastAPI router 解析 OpenAI 风格参数，serving 层把 messages/
+prompt 渲染成 vLLM `EngineInput`，再通过 `AsyncLLM`/`EngineClient` 交给
+EngineCore、scheduler、KV cache manager、worker 和 model runner 执行。
+
+主启动链路：
+`__main__ -> run_server -> setup_server -> run_server_worker
+ -> build_async_engine_client -> AsyncLLM.from_vllm_config
+ -> build_and_serve -> build_app -> init_app_state -> serve_http`
+"""
 import asyncio
 import importlib
 import inspect
@@ -81,6 +102,8 @@ async def build_async_engine_client(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    # API server 从 CLI Namespace 出发创建 EngineClient。这里先处理
+    # multiprocessing/forkserver 的启动细节，再把参数规整成 AsyncEngineArgs。
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -94,6 +117,8 @@ async def build_async_engine_client(
     # Ensures everything is shutdown and cleaned up on error/exit
     engine_args = AsyncEngineArgs.from_cli_args(args)
     if client_config:
+        # 多 API 进程场景下记录当前 API process 的数量和 rank，
+        # 后续 AsyncLLM 会用这些信息建立对应的 engine/client 拓扑。
         engine_args._api_process_count = client_config.get("client_count", 1)
         engine_args._api_process_rank = client_config.get("client_index", 0)
 
@@ -120,6 +145,8 @@ async def build_async_engine_client_from_engine_args(
     Returns the Client or None if the creation failed.
     """
 
+    # 这是在线服务创建引擎的主路径：AsyncEngineArgs 先生成 VllmConfig，
+    # 然后用 V1 AsyncLLM 暴露 EngineClient 接口给 FastAPI handlers。
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
@@ -133,6 +160,8 @@ async def build_async_engine_client_from_engine_args(
     client_index = client_config.pop("client_index", 0)
 
     try:
+        # AsyncLLM 内部负责启动 engine core、executor/worker，并提供异步
+        # add/generate/abort/metrics 等 API server 需要的 engine client 能力。
         async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
@@ -159,6 +188,8 @@ def build_app(
     supported_tasks: tuple["SupportedTask", ...] | None = None,
     model_config: ModelConfig | None = None,
 ) -> FastAPI:
+    # 构建 FastAPI app，并根据模型支持的 task 注册不同 router。
+    # 这个函数只组装 HTTP 层，不创建 engine，也不初始化 app.state 中的依赖。
     if supported_tasks is None:
         warnings.warn(
             "The 'supported_tasks' parameter was not provided to "
@@ -196,6 +227,8 @@ def build_app(
     register_sagemaker_api_router(app, supported_tasks, model_config)
 
     if "generate" in supported_tasks:
+        # 生成类模型才注册 completions/chat/generative scoring、
+        # disaggregated prefill、RLHF、elastic EP 等生成相关路由。
         from vllm.entrypoints.openai.generate.api_router import (
             register_generate_api_routers,
         )
@@ -227,6 +260,8 @@ def build_app(
         register_generative_scoring_api_router(app)
 
     if "generate" in supported_tasks or "render" in supported_tasks:
+        # render 路由提供 prompt/chat template 渲染能力；普通生成服务和
+        # CPU-only render server 都会用到。
         from vllm.entrypoints.serve.render.api_router import (
             attach_router as attach_render_router,
         )
@@ -234,6 +269,7 @@ def build_app(
         attach_render_router(app)
 
     if "transcription" in supported_tasks or "realtime" in supported_tasks:
+        # 语音模型相关路由，包括转写和 realtime WebSocket 能力。
         from vllm.entrypoints.speech_to_text.factories import (
             register_speech_to_text_api_routers,
         )
@@ -241,10 +277,13 @@ def build_app(
         register_speech_to_text_api_routers(app, supported_tasks)
 
     if any(task in POOLING_TASKS for task in supported_tasks):
+        # embedding、classification、rerank、reward 等 pooling 类型任务走这里。
         from vllm.entrypoints.pooling.factories import register_pooling_api_routers
 
         register_pooling_api_routers(app, supported_tasks, model_config)
 
+    # HTTP 通用能力：root path、CORS、异常处理、认证、request id、
+    # scaling 状态检查、自定义 middleware 等都在 app 层完成。
     app.root_path = args.root_path
     app.add_middleware(
         CORSMiddleware,
@@ -292,6 +331,8 @@ def build_app(
         app.middleware("http")(log_response)
 
     for middleware in args.middleware:
+        # 用户可以通过 --middleware 注入自定义 FastAPI middleware 类，
+        # 或注入一个 coroutine function 作为 HTTP middleware。
         module_path, object_name = middleware.rsplit(".", 1)
         imported = getattr(importlib.import_module(module_path), object_name)
         if inspect.isclass(imported):
@@ -313,6 +354,8 @@ async def init_app_state(
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
 ) -> None:
+    # 初始化请求处理时需要挂在 app.state 上的对象：engine client、
+    # OpenAI 模型 registry、renderer、tokenization service、各任务 state 等。
     vllm_config = engine_client.vllm_config
 
     # Propagate enable_in_reasoning to the API-server process. The engine core
@@ -353,6 +396,8 @@ async def init_app_state(
         BaseModelPath(name=name, model_path=args.model) for name in served_model_names
     ]
 
+    # 这些 state 字段会被各个 router/handler 读取，是 FastAPI 层和
+    # vLLM engine 层之间的依赖注入点。
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
@@ -367,6 +412,8 @@ async def init_app_state(
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
+    # OpenAIServingModels 维护 served model name、base model path、LoRA
+    # registry 等模型展示/选择信息，支撑 /v1/models 和请求中的 model 字段。
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
         base_model_paths=base_model_paths,
@@ -374,6 +421,8 @@ async def init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
+    # OpenAIServingRender 负责 OpenAI 风格 messages/tools/reasoning 参数到
+    # vLLM EngineInput 的渲染，是在线服务里的输入转换层。
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -390,6 +439,8 @@ async def init_app_state(
         log_error_stack=args.log_error_stack,
     )
 
+    # tokenization endpoints 复用模型 registry 和 render 配置，
+    # 用来提供 tokenize/detokenize 等不一定触发推理的 API。
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         state.openai_serving_models,
@@ -402,6 +453,8 @@ async def init_app_state(
     )
 
     if "generate" in supported_tasks:
+        # 生成任务的 completions/chat handlers 在这里初始化自己的 serving
+        # 对象，例如 request parser、streaming response builder 等。
         from vllm.entrypoints.openai.generate.api_router import init_generate_state
 
         await init_generate_state(
@@ -415,6 +468,7 @@ async def init_app_state(
         await init_generative_scoring_state(engine_client, state, args, request_logger)
 
     if "transcription" in supported_tasks or "realtime" in supported_tasks:
+        # speech/realtime 任务需要额外的音频输入处理和 WebSocket 相关状态。
         from vllm.entrypoints.speech_to_text.factories import init_speech_to_text_state
 
         init_speech_to_text_state(
@@ -422,6 +476,7 @@ async def init_app_state(
         )
 
     if any(task in POOLING_TASKS for task in supported_tasks):
+        # pooling 任务初始化 embedding/rerank/classification 等专用 serving 状态。
         from vllm.entrypoints.pooling.factories import init_pooling_state
 
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
@@ -442,6 +497,8 @@ async def init_render_app_state(
     preprocessing pipeline (renderer, input_processor)
     directly from the :class:`~vllm.config.VllmConfig`.
     """
+    # render-only server 不连接 engine，也不加载 worker；它只根据 VllmConfig
+    # 构建 renderer 和模型 registry，服务 prompt 渲染/tokenization 类请求。
     from vllm.entrypoints.chat_utils import load_chat_template
     from vllm.entrypoints.openai.models.serving import OpenAIModelRegistry
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -495,6 +552,8 @@ async def init_render_app_state(
 
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
+    # 提前创建并 bind TCP socket，支持 IPv4/IPv6。这样可以在 engine
+    # 初始化前占住端口，避免多个进程或 Ray 启动时发生端口竞争。
     family = socket.AF_INET
     if is_valid_ipv6_address(addr[0]):
         family = socket.AF_INET6
@@ -508,12 +567,15 @@ def create_server_socket(addr: tuple[str, int]) -> socket.socket:
 
 
 def create_server_unix_socket(path: str) -> socket.socket:
+    # Unix domain socket 模式，用于本机进程间通过文件路径访问 API server。
     sock = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
     sock.bind(path)
     return sock
 
 
 def validate_api_server_args(args):
+    # 校验 OpenAI API server 专属参数，尤其是 tool parser 和 reasoning
+    # parser 是否已经注册或由 plugin 成功导入。
     valid_tool_parses = ToolParserManager.list_registered()
     if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
         raise KeyError(
@@ -535,6 +597,8 @@ def validate_api_server_args(args):
 def setup_server(args):
     """Validate API server args and create the server socket."""
 
+    # server 启动前的同步准备：记录参数、加载 parser plugin、校验参数、
+    # bind socket、调整 ulimit，并返回 uvicorn 需要使用的监听地址。
     log_version_and_model(logger, VLLM_VERSION, args.model)
     log_non_default_args(args)
 
@@ -581,6 +645,8 @@ async def build_and_serve(
     Returns the shutdown task for the caller to await.
     """
 
+    # 在线推理服务的装配函数：拿到 engine client 后，先根据 engine 支持的
+    # tasks 构建 FastAPI app，再初始化 app.state，最后交给 uvicorn serve。
     # Get uvicorn log config (from file or with endpoint filter)
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
@@ -630,6 +696,8 @@ async def build_and_serve_renderer(
     Returns the shutdown task for the caller to await.
     """
 
+    # render-only 服务的装配函数：没有 engine client，只有 render/tokenize
+    # 能力，因此支持 task 固定为 ("render",)。
     # Get uvicorn log config (from file or with endpoint filter)
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
@@ -665,6 +733,8 @@ async def build_and_serve_renderer(
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
+    # 单 worker API server 的顶层入口。它先做日志和信号处理，再创建
+    # socket，最后进入 run_server_worker。
     decorate_logs("APIServer", skip_if_decorated=True)
 
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
@@ -683,6 +753,8 @@ async def run_server_worker(
 ) -> None:
     """Run a single API server worker."""
 
+    # 一个 API server worker 的完整生命周期：加载插件，创建 engine client，
+    # 构建并启动 HTTP server，退出时关闭 socket。
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
 
@@ -707,6 +779,8 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
+    # 兼容直接执行 `python -m vllm.entrypoints.openai.api_server` 的入口：
+    # 设置 CLI 环境、解析 serve 参数，然后用 uvloop 启动 async server。
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."

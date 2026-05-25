@@ -1,5 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# 本文件是 vLLM V1 前台与 EngineCore 后端之间的 client 层。
+#
+# 在整体链路中的定位：
+# - async_llm.py 通过 EngineCoreClient 的 async API 提交请求、拉取输出、
+#   调用 pause/resume/cache/LoRA/profile 等控制面能力；
+# - core_client.py 根据运行模式选择 InprocClient、SyncMPClient、AsyncMPClient
+#   或数据并行版本，并负责 ZMQ socket、后台 EngineCore 生命周期、序列化、
+#   utility RPC、输出队列和异常传播；
+# - core.py 中的 EngineCoreProc/EngineCoreActor 接收这里发送的消息，执行
+#   scheduler/model_executor 主循环，再把 EngineCoreOutputs 发回这里。
+#
+# 请求进入的核心流程：
+# AsyncLLM.generate()/encode()
+#   -> EngineCoreClient.add_request_async()
+#   -> AsyncMPClient/DPAsyncMPClient._send_input()
+#   -> ZMQ ROUTER socket 发送 ADD 消息
+#   -> core.py 的 EngineCoreProc.process_input_sockets()
+#   -> EngineCore.run_busy_loop() / scheduler.add_request()。
+#
+# 输出回流的核心流程：
+# core.py 的 EngineCoreProc.process_output_sockets()
+#   -> ZMQ PUSH EngineCoreOutputs
+#   -> AsyncMPClient._ensure_output_queue_task() 后台 task 接收并反序列化
+#   -> outputs_queue
+#   -> AsyncLLM 的 output_handler 调用 get_output_async()
+#   -> OutputProcessor 分发到每个请求的 RequestOutputCollector。
+#
+# 控制面调用的核心流程：
+# AsyncLLM.pause_generation()/reset_cache/add_lora/profile/collective_rpc...
+#   -> call_utility_async()
+#   -> ZMQ 发送 UTILITY(method, args)
+#   -> EngineCoreProc._handle_client_request()
+#   -> getattr(engine_core, method)(*args)
+#   -> UtilityOutput 回到等待中的 Future。
 import asyncio
 import contextlib
 import queue
@@ -77,6 +112,7 @@ class EngineCoreClient(ABC):
     * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
     """
 
+    # 根据是否多进程、是否 asyncio，选择合适的 EngineCoreClient 实现。
     @staticmethod
     def make_client(
         multiprocess_mode: bool,
@@ -102,6 +138,7 @@ class EngineCoreClient(ABC):
 
         return InprocClient(vllm_config, executor_class, log_stats)
 
+    # 创建 AsyncLLM serving 路径使用的多进程异步 client。
     @staticmethod
     @instrument(span_name="Overall Loading")
     def make_async_mp_client(
@@ -129,67 +166,87 @@ class EngineCoreClient(ABC):
             return DPLBAsyncMPClient(*client_args)
         return AsyncMPClient(*client_args)
 
+    # 子类负责释放 EngineCore 后端和 socket/任务等资源。
     @abstractmethod
     def shutdown(self, timeout: float | None = None) -> None: ...
 
+    # 同步路径：拉取一批 EngineCoreOutputs。
     def get_output(self) -> EngineCoreOutputs:
         raise NotImplementedError
 
+    # 查询后端模型支持的任务类型。
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
+    # 同步路径：提交一个 EngineCoreRequest。
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    # 开启或停止后端 profiling。
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         raise NotImplementedError
 
+    # 重置多模态缓存。
     def reset_mm_cache(self) -> None:
         raise NotImplementedError
 
+    # 重置 prefix cache。
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         raise NotImplementedError
 
+    # 重置 encoder cache。
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
+    # 让后端进入 sleep 状态。
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
+    # 唤醒后端。
     def wake_up(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
+    # 查询后端是否处于 sleep/paused 状态。
     def is_sleeping(self) -> bool:
         raise NotImplementedError
 
+    # 执行 dummy batch。
     def execute_dummy_batch(self) -> None:
         raise NotImplementedError
 
+    # 异步路径：执行 dummy batch。
     async def execute_dummy_batch_async(self) -> None:
         raise NotImplementedError
 
+    # 中止一组请求。
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    # 加载 LoRA adapter。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
+    # 移除 LoRA adapter。
     def remove_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    # 列出已加载 LoRA adapter。
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    # 固定 LoRA adapter，避免被驱逐。
     def pin_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    # 保存分片权重状态。
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         raise NotImplementedError
 
+    # 在后端 worker 上执行 collective RPC。
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -199,68 +256,87 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    # 查询数据并行 EngineCore 是否处于运行 wave 中。
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
         raise NotImplementedError
 
+    # elastic EP 场景下调整数据并行大小。
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         raise NotImplementedError
 
+    # 异步路径：拉取一批 EngineCoreOutputs。
     async def get_output_async(self) -> EngineCoreOutputs:
         raise NotImplementedError
 
+    # 异步路径：查询后端支持任务。
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
+    # 异步路径：提交请求。
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    # 异步路径：开启或停止 profiling。
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
     ) -> None:
         raise NotImplementedError
 
+    # 异步路径：重置多模态缓存。
     async def reset_mm_cache_async(self) -> None:
         raise NotImplementedError
 
+    # 异步路径：重置 prefix cache。
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         raise NotImplementedError
 
+    # 异步路径：重置 encoder cache。
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
+    # 异步路径：让后端进入 sleep 状态。
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
+    # 异步路径：唤醒后端。
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
+    # 异步路径：查询后端是否 sleeping。
     async def is_sleeping_async(self) -> bool:
         raise NotImplementedError
 
+    # 异步路径：中止请求。
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    # 异步路径：加载 LoRA adapter。
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
+    # 异步路径：移除 LoRA adapter。
     async def remove_lora_async(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    # 异步路径：列出 LoRA adapter。
     async def list_loras_async(self) -> set[int]:
         raise NotImplementedError
 
+    # 异步路径：固定 LoRA adapter。
     async def pin_lora_async(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    # 异步路径：保存分片权重状态。
     async def save_sharded_state_async(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         raise NotImplementedError
 
+    # 异步路径：执行 collective RPC。
     async def collective_rpc_async(
         self,
         method: str | Callable[..., _R],
@@ -281,34 +357,43 @@ class InprocClient(EngineCoreClient):
         * pulls EngineCoreOutputs by stepping the EngineCore
     """
 
+    # 在当前进程内直接创建 EngineCore，不启动后台 busy loop。
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
 
+    # 同进程模式下由 client 主动调用 step_fn() 拉取输出。
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
+    # 直接透传 EngineCore 支持的任务类型。
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
 
+    # 预处理 EngineCoreRequest 后直接加入同进程 EngineCore。
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
+    # 同进程模式下直接调用 EngineCore abort。
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
+    # 关闭同进程 EngineCore。
     def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
 
+    # 透传 profiling 控制到 EngineCore。
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.engine_core.profile(is_start, profile_prefix)
 
+    # 透传多模态缓存重置。
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
 
+    # 透传 prefix cache 重置。
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -316,41 +401,52 @@ class InprocClient(EngineCoreClient):
             reset_running_requests, reset_connector
         )
 
+    # 透传 encoder cache 重置。
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
 
+    # 同进程 sleep 不支持 wait 模式，只支持同步完成的 pause/sleep。
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
             raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
         result = self.engine_core.sleep(level, mode)
         assert result is None
 
+    # 唤醒同进程 EngineCore。
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
 
+    # 查询同进程 EngineCore 是否 sleeping。
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
 
+    # 透传 dummy batch 执行。
     def execute_dummy_batch(self) -> None:
         self.engine_core.execute_dummy_batch()
 
+    # 透传 LoRA 加载。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine_core.add_lora(lora_request)
 
+    # 透传 LoRA 移除。
     def remove_lora(self, lora_id: int) -> bool:
         return self.engine_core.remove_lora(lora_id)
 
+    # 透传 LoRA 列表查询。
     def list_loras(self) -> set[int]:
         return self.engine_core.list_loras()
 
+    # 透传 LoRA pin。
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
 
+    # 透传分片权重保存。
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         self.engine_core.save_sharded_state(path, pattern, max_size)
 
+    # 透传 collective RPC。
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -360,6 +456,7 @@ class InprocClient(EngineCoreClient):
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
+    # 同进程 client 不维护 DP wave 运行状态。
     def dp_engines_running(self) -> bool:
         return False
 
@@ -387,6 +484,7 @@ class BackgroundResources:
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
 
+    # 清理后台 EngineCore、coordinator、ZMQ socket 和 asyncio task。
     def __call__(self):
         """Clean up background resources."""
 
@@ -444,6 +542,7 @@ class BackgroundResources:
                     # Send shutdown signal.
                     shutdown_sender.send(b"")
 
+    # 检测 EngineCoreProc 发来的死亡哨兵，并转换为 EngineDeadError。
     def validate_alive(self, frames: Sequence[zmq.Frame]):
         if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
             self.engine_dead = True
@@ -470,6 +569,7 @@ class MPClient(EngineCoreClient):
         * SyncMPClient subclass for LLM usage
     """
 
+    # 初始化多进程 client：创建 ZMQ、启动/连接 EngineCore，并等待 ready。
     def __init__(
         self,
         asyncio_mode: bool,
@@ -610,6 +710,7 @@ class MPClient(EngineCoreClient):
             if not success:
                 self._finalizer()
 
+    # 关闭 EngineCore manager 并清理 ZMQ/后台任务资源。
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine manager under timeout and clean up resources."""
         if self._finalizer.detach() is not None:
@@ -617,27 +718,33 @@ class MPClient(EngineCoreClient):
                 self.resources.engine_manager.shutdown(timeout=timeout)
             self.resources()
 
+    # 如果后端已死亡，把底层异常包装成更清晰的 EngineDeadError。
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
         return (
             EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
         )
 
+    # 发送请求前确认后端仍存活。
     def ensure_alive(self):
         if self.resources.engine_dead:
             raise EngineDeadError()
 
+    # 保留含 tensor buffer 的消息引用，直到 ZMQ 完成发送。
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
         if not tracker.done:
             self.pending_messages.appendleft((tracker, msg))
 
+    # 释放已经完成发送的 pending message 引用。
     def free_pending_messages(self):
         while self.pending_messages and self.pending_messages[-1][0].done:
             self.pending_messages.pop()
 
+    # 返回数据并行 engines 是否处于运行状态。
     def dp_engines_running(self) -> bool:
         return self.engines_running
 
+    # 启动后台监控线程，发现 EngineCore 异常退出时标记 engine_dead。
     def start_engine_core_monitor(self):
         """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
@@ -664,6 +771,7 @@ class MPClient(EngineCoreClient):
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
 
+    # 处理 EngineCore ready 响应，并同步 max_model_len/KV cache 等初始化结果。
     def _apply_ready_response(self, payload: bytes) -> None:
         """Decode an EngineCoreReadyResponse and sync any post-initialization
         config changes (e.g. auto-fitted max_model_len) back to the frontend."""
@@ -716,6 +824,7 @@ def _process_utility_output(
 class SyncMPClient(MPClient):
     """Synchronous client for multi-proc EngineCore."""
 
+    # 初始化同步多进程 client，并启动输出 socket 处理线程。
     @instrument(span_name="SyncMPClient init")
     def __init__(
         self, vllm_config: VllmConfig, executor_class: type[Executor], log_stats: bool
@@ -783,6 +892,7 @@ class SyncMPClient(MPClient):
         # The thread takes on responsibility for closing the socket.
         self.resources.output_socket = None
 
+    # 从线程安全队列中同步获取 EngineCoreOutputs。
     def get_output(self) -> EngineCoreOutputs:
         # If an exception arises in process_outputs_socket task,
         # it is forwarded to the outputs_queue so we can raise it
@@ -795,6 +905,7 @@ class SyncMPClient(MPClient):
             self.engines_running = False
         return outputs
 
+    # 同步路径：序列化请求并通过 ZMQ 发给当前 EngineCore。
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
         self.ensure_alive()
         self.free_pending_messages()
@@ -809,6 +920,7 @@ class SyncMPClient(MPClient):
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
         self.add_pending_message(tracker, request)
 
+    # 发起同步 utility RPC，并阻塞等待 UtilityOutput 返回。
     def call_utility(self, method: str, *args) -> Any:
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
@@ -817,24 +929,30 @@ class SyncMPClient(MPClient):
 
         return future.result()
 
+    # 通过 utility RPC 查询后端支持任务。
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.call_utility("get_supported_tasks")
 
+    # 同步提交请求；DP 场景下标记 engines 正在运行。
     def add_request(self, request: EngineCoreRequest) -> None:
         if self.is_dp:
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
+    # 同步发送 abort 请求。
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    # 通过 utility RPC 控制 profiling。
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.call_utility("profile", is_start, profile_prefix)
 
+    # 通过 utility RPC 重置多模态缓存。
     def reset_mm_cache(self) -> None:
         self.call_utility("reset_mm_cache")
 
+    # 通过 utility RPC 重置 prefix cache。
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -842,33 +960,43 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    # 通过 utility RPC 重置 encoder cache。
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    # 通过 utility RPC 加载 LoRA。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
+    # 通过 utility RPC 移除 LoRA。
     def remove_lora(self, lora_id: int) -> bool:
         return self.call_utility("remove_lora", lora_id)
 
+    # 通过 utility RPC 列出 LoRA。
     def list_loras(self) -> set[int]:
         return self.call_utility("list_loras")
 
+    # 通过 utility RPC 固定 LoRA。
     def pin_lora(self, lora_id: int) -> bool:
         return self.call_utility("pin_lora", lora_id)
 
+    # 通过 utility RPC 让后端 sleep。
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         self.call_utility("sleep", level, mode)
 
+    # 通过 utility RPC 唤醒后端。
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.call_utility("wake_up", tags)
 
+    # 通过 utility RPC 查询 sleep 状态。
     def is_sleeping(self) -> bool:
         return self.call_utility("is_sleeping")
 
+    # 通过 utility RPC 执行 dummy batch。
     def execute_dummy_batch(self) -> None:
         self.call_utility("execute_dummy_batch")
 
+    # 通过 utility RPC 执行 collective RPC。
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -878,6 +1006,7 @@ class SyncMPClient(MPClient):
     ) -> list[_R]:
         return self.call_utility("collective_rpc", method, timeout, args, kwargs)
 
+    # 通过 utility RPC 保存分片状态。
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
@@ -887,6 +1016,7 @@ class SyncMPClient(MPClient):
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
 
+    # 初始化 AsyncLLM 使用的异步多进程 client。
     @instrument(span_name="AsyncMPClient init")
     def __init__(
         self,
@@ -918,6 +1048,7 @@ class AsyncMPClient(MPClient):
         except RuntimeError:
             pass
 
+    # 确保异步输出接收 task 已启动。
     def _ensure_output_queue_task(self):
         resources = self.resources
         if resources.output_queue_task is not None:
@@ -987,6 +1118,7 @@ class AsyncMPClient(MPClient):
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
         )
 
+    # 从 asyncio 队列中等待下一批 EngineCoreOutputs。
     async def get_output_async(self) -> EngineCoreOutputs:
         self._ensure_output_queue_task()
         # If an exception arises in process_outputs_socket task,
@@ -998,6 +1130,7 @@ class AsyncMPClient(MPClient):
             raise self._format_exception(outputs) from None
         return outputs
 
+    # 异步路径：把请求类型和 payload 发给指定 EngineCore。
     def _send_input(
         self,
         request_type: EngineCoreRequestType,
@@ -1010,6 +1143,7 @@ class AsyncMPClient(MPClient):
         message = (request_type.value, *self.encoder.encode(request))
         return self._send_input_message(message, engine, request)
 
+    # 通过 ZMQ 发送已序列化消息，并保留 tensor buffer 引用直到发送完成。
     def _send_input_message(
         self, message: tuple[bytestr, ...], engine: EngineIdentity, objects: Any
     ) -> Awaitable[Any]:
@@ -1035,9 +1169,11 @@ class AsyncMPClient(MPClient):
         future.add_done_callback(add_pending)
         return future
 
+    # 对默认 EngineCore 发起异步 utility RPC。
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
+    # 对指定 EngineCore 发起异步 utility RPC，并等待对应 Future。
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
@@ -1052,37 +1188,46 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
         return await future
 
+    # 异步查询后端支持任务。
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
 
+    # 异步提交请求，并记录当前 API client index。
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
 
+    # 异步发送 abort 请求。
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    # 异步暂停后端 scheduler。
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> None:
         await self.call_utility_async("pause_scheduler", mode, clear_cache)
 
+    # 异步恢复后端 scheduler。
     async def resume_scheduler_async(self) -> None:
         await self.call_utility_async("resume_scheduler")
 
+    # 异步查询 scheduler pause 状态。
     async def is_scheduler_paused_async(self) -> bool:
         return await self.call_utility_async("is_scheduler_paused")
 
+    # 异步控制 profiling。
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
     ) -> None:
         await self.call_utility_async("profile", is_start, profile_prefix)
 
+    # 异步重置多模态缓存。
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")
 
+    # 异步重置 prefix cache。
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -1090,38 +1235,49 @@ class AsyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    # 异步重置 encoder cache。
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
 
+    # 异步让后端进入 sleep 状态。
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)
 
+    # 异步唤醒后端。
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
 
+    # 异步查询后端 sleep 状态。
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
 
+    # 异步执行 dummy batch。
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
 
+    # 异步加载 LoRA。
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         return await self.call_utility_async("add_lora", lora_request)
 
+    # 异步移除 LoRA。
     async def remove_lora_async(self, lora_id: int) -> bool:
         return await self.call_utility_async("remove_lora", lora_id)
 
+    # 异步列出 LoRA。
     async def list_loras_async(self) -> set[int]:
         return await self.call_utility_async("list_loras")
 
+    # 异步固定 LoRA。
     async def pin_lora_async(self, lora_id: int) -> bool:
         return await self.call_utility_async("pin_lora", lora_id)
 
+    # 异步保存分片权重状态。
     async def save_sharded_state_async(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         await self.call_utility_async("save_sharded_state", path, pattern, max_size)
 
+    # 异步执行 collective RPC。
     async def collective_rpc_async(
         self,
         method: str | Callable[..., _R],
@@ -1138,6 +1294,7 @@ class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Assumes external load-balancing by default."""
 
+    # 初始化数据并行异步 client，维护 wave、负载统计和 first-req 通知通道。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1176,6 +1333,7 @@ class DPAsyncMPClient(AsyncMPClient):
         except RuntimeError:
             pass
 
+    # 启动 DP stats 更新 task，接收 coordinator 的 wave/负载状态。
     def _ensure_stats_update_task(self):
         resources = self.resources
         if resources.stats_update_task is not None:
@@ -1293,6 +1451,7 @@ class DPAsyncMPClient(AsyncMPClient):
             run_engine_stats_update_task()
         )
 
+    # 数据并行提交请求：写入 wave，选择 EngineCore，并在 idle 时唤醒 coordinator。
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         self._ensure_stats_update_task()
 
@@ -1310,6 +1469,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
         self._ensure_output_queue_task()
 
+    # 外部 LB 场景默认只向当前 core_engine 发送请求。
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
 
@@ -1318,6 +1478,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
 
+    # 初始化内部负载均衡 DP client，并维护 request_id 到 engine 的映射。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1347,6 +1508,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+    # 根据显式 DP rank、late interaction 分片或本地负载统计选择 EngineCore。
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
@@ -1377,6 +1539,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
 
+    # 对所有 DP EngineCore 广播 utility RPC，只返回第一个结果。
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
         return (
@@ -1388,6 +1551,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
         )[0]
 
+    # 处理输出中的 finished_requests，清理 request 到 engine 的映射。
     @staticmethod
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
@@ -1396,6 +1560,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
 
+    # 处理 EngineCore 发来的 elastic EP 通知，并推进扩缩容状态机。
     @staticmethod
     async def eep_process_engine_core_notification(
         self: "DPLBAsyncMPClient", notification_data: tuple[str, int]
@@ -1457,6 +1622,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             ]:
                 self.eep_scaling_cache = None
 
+    # 按 request_id 找回原 EngineCore，并只向相关 engine 发送 abort。
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if not request_ids or self.resources.engine_dead:
             return
@@ -1474,11 +1640,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
 
+    # 向指定 EngineCore 发送 abort。
     async def _abort_requests(
         self, request_ids: list[str], engine: EngineIdentity
     ) -> None:
         await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)
 
+    # elastic EP 入口：根据目标 DP size 选择 scale up 或 scale down。
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Scale elastic EP data parallel size"""
         cur_data_parallel_size = len(self.core_engines)
@@ -1503,6 +1671,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 cur_data_parallel_size, new_data_parallel_size
             )
 
+    # 等待所有 EngineCore 切换到 elastic EP 新配置。
     async def _eep_wait_for_setup_switch_complete(self) -> None:
         """
         Wait for core engines to switch to the new setup.
@@ -1517,6 +1686,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self._ensure_output_queue_task()
         await future
 
+    # 为 elastic EP 重配置创建 TCP store 和新的端口配置。
     def _setup_elastic_ep_reconfig_bootstrap(self) -> tuple[str, int]:
         from vllm.distributed.utils import create_tcp_store
         from vllm.utils.network_utils import get_open_ports_list
@@ -1539,6 +1709,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self._coord_store = store
         return ip, store.port
 
+    # elastic EP 扩容：重配旧 engine、创建新 engine、等待 ready 并通知 coordinator。
     async def _scale_up_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
     ) -> None:
@@ -1632,6 +1803,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             new_data_parallel_size,
         )
 
+    # elastic EP 缩容：标记移除 engine、重配保留 engine，并更新本地路由表。
     async def _scale_down_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
     ) -> None:
